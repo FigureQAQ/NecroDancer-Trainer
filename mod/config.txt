@@ -1,0 +1,4 @@
+invincible=0
+oneHit=0
+doubleDamage=0
+infiniteCoins=0
