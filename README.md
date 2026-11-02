@@ -1,36 +1,66 @@
 # Crypt of the NecroDancer Trainer
 
-一个使用 Python/Tkinter 制作的《Crypt of the NecroDancer》图形化修改器。
+面向 Windows Steam 版《Crypt of the NecroDancer v4.2.1-b5713》的本地单机修改器。修改器通过 Synchrony unpacked mod 读取配置，不扫描内存、不注入游戏进程，也不修改游戏 EXE。
 
-## 当前状态
+## 功能
 
-- 支持通过真实进程路径检测游戏，不扫描内存。
-- 支持从 Steam 启动游戏，找不到 Steam 时尝试直接启动游戏。
-- 支持自动部署本地 unpacked mod，并写入当前用户的 mod 列表。
-- 无敌、一击必杀、双倍伤害和无限金币开关通过本地模组配置驱动。
-- 支持修改存档中的永久钻石数量，并在修改前自动备份存档。
-- 已验证当前 `v4.2.1-b5713` 模组可以正常挂载且启动无 Lua 错误；战斗效果仍应在单机房间内自行确认。
+- 深色图形界面：功能开关与快捷键在左侧，数值设置在右侧，常用道具操作与角色搜索位于底部。
+- 图形化开关：强制跟拍、无敌、一击必杀、双倍伤害、商店免费购买、可挖掘所有方块、解锁全部区域和角色、区域切换保留金币。
+- 数值应用：生命上限、金币数量、金币获取倍数、目标关卡。
+- 获取道具或武器：在独立道具库中按类别浏览图标网格、搜索中文名或内部 ID；悬停显示中文名称和效果说明，点击图标即可请求游戏内发放。
+- 显示本层全部道具：调用游戏内单片眼镜（`head_monocle`），会替换头部装备。
+- 视野范围：输入目标半径格数并应用；游戏支持时直接更新玩家视野。也可一键装备三级火把，增加 3 格视野并替换当前火把。
+- 道具和角色支持按中文名称、中文别名或内部 ID 搜索；输入第一个字时就会显示候选，例如输入“黑”可选择“黑曜石火把”。
+- 存档修改：永久钻石数量，写入前自动备份到 `%APPDATA%\NecroDancer\ModifierBackups`。
+- 区域和角色解锁：Mod 会在游戏内解锁深度 2、3、4、钥匙区域和可用角色；同时会尝试写入当前存档并自动备份。
+- 自动检测 `Necrodancer.exe`，可通过 Steam 启动游戏。
+- 游戏本体已有简体中文资源，修改器会保留 `zh_CN` 设置，不覆盖原始语言文件。
 
-## 使用方法
+界面会将金币倍率应用于拾取获得的金币；视野半径输入 0 会关闭自定义覆盖。设置生命上限通过游戏 Health API 增加生命上限，当前生命只在超出新上限时被截断。
 
-1. 下载 `dist/NecroDancerTrainer_Invincible.exe`。
-2. 双击 EXE，修改器会自动定位 Steam 游戏目录并部署模组。
-3. 点击开关后启动或重新启动游戏；配置文件位于 `%LOCALAPPDATA%\NecroDancer\mods\NecroDancerTrainer`。
-4. 修改钻石前退出游戏，修改后重新启动游戏读取存档。
+“区域切换保留金币”默认开启，会在关卡转换时保存当前金币并在新关卡载入后恢复；关闭时保持游戏默认行为，不影响正常消费。
 
-## 环境
+## 使用
 
-- Windows
-- Steam App ID: `247080`
-- 当前针对游戏版本：`v4.2.1-b5713`
+1. 运行 `dist\NecroDancerTrainer_Invincible.exe`；界面使用系统默认字体并适配 Windows DPI 缩放。
+2. 等待顶部显示游戏 PID；如果游戏已启动，点击“重新连接”。
+3. 开关点击后立即写入本地 Mod 配置，游戏内约四分之一秒刷新一次。
+4. 点击“获得道具或武器”打开独立道具库；搜索或筛选后点击物品图标即可获取。悬停图标可查看中文名称、效果说明和内部 ID。角色可输入中文名或 ID，从候选中选择后点击“切换”。
+5. 修改永久钻石前退出游戏，写入后重新启动游戏读取存档。
+6. 顶部 `—` 按钮最小化，`×` 按钮关闭修改器；按 `Esc` 也可以关闭。
+
+修改器仅在游戏关闭时同步启用列表中的 Mod 版本，并在修改前自动备份。如果遇到“模组缺失”且显示旧版本，请退出游戏，保持修改器运行后再启动游戏。不要同时运行不同版本的修改器。
+
+游戏运行时禁止直接写入永久钻石或区域解锁存档，避免被退出时的存档覆盖；解锁开关仍可交给游戏内 Mod 执行。数值只有点击应用后才生效，切换功能不会发送尚未应用的输入值，也不会清空等待执行的道具、角色和关卡请求。
+
+快捷键默认使用小键盘数字：
+
+- 小键盘 `1` 到 `6`：切换强制跟拍、无敌、一击必杀、双倍伤害、可挖掘所有方块、解锁全部区域和角色。
+- `Ctrl` + 小键盘 `1`：应用金币数量；`Ctrl` + 小键盘 `2`：写入永久钻石。
+- `Ctrl` + 小键盘 `3`：切换所有道具免费；`Ctrl` + 小键盘 `4`：设置生命上限。
+- `Ctrl` + 小键盘 `7`：请求目标关卡；`Ctrl` + 小键盘 `8`：设置金币获取倍数；`Ctrl` + 小键盘 `9`：设置视野半径格数。
+
+本地配置位置：
+
+```text
+%LOCALAPPDATA%\NecroDancer\mods\NecroDancerTrainer\config.txt
+```
 
 ## 构建
 
 ```powershell
-python -m pip install pyinstaller
+python -m pip install -r requirements.txt
 pyinstaller --noconfirm --clean --onefile --windowed --add-data ".\mod;mod" --name NecroDancerTrainer_Invincible .\NecroDancerModifier.py
 ```
 
-## 注意
+`--windowed` 确保发布的 EXE 不打开命令框。项目不包含游戏本体、游戏资源、WSP 包或用户存档。
 
-本项目不包含《Crypt of the NecroDancer》的任何游戏本体、资源文件、存档或修改后的游戏包。使用前请自行备份游戏文件和存档。
+## 测试
+
+```powershell
+python -m unittest discover -s tests -v
+python tools/run_runtime_tests.py
+python tools/ui_smoke_test.py
+```
+
+Lua 测试使用本机已安装游戏的 `lua51.dll`，不随项目分发。路径不同可设置环境变量 `NECRODANCER_GAME_DIR`，指向包含该 DLL 的 `Necrodancer64` 目录。测试模拟游戏事件和实体，不能替代游戏内逐项验证。
