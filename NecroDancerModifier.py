@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import tkinter as tk
 import tkinter.font as tkfont
@@ -90,6 +91,73 @@ def enable_process_dpi_awareness() -> None:
         pass
 
 
+class GameRunningError(OSError):
+    pass
+
+
+def backup_and_replace_save(
+    path: Path,
+    original: bytes,
+    updated: str,
+    backup_tag: str,
+    before_replace=None,
+) -> Path:
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    backup_prefix = f"{path.name}.{backup_tag}_"
+    for existing in BACKUP_DIR.glob(f"{backup_prefix}*.bak"):
+        try:
+            if existing.read_bytes() == original:
+                break
+        except OSError:
+            continue
+    else:
+        existing = None
+    if existing is not None:
+        backup = existing
+    else:
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        backup_base = f"{backup_prefix}{timestamp}"
+        suffix = 0
+        while True:
+            extra = "" if suffix == 0 else f"_{suffix}"
+            backup = BACKUP_DIR / f"{backup_base}{extra}.bak"
+            try:
+                with backup.open("xb") as stream:
+                    stream.write(original)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                break
+            except FileExistsError:
+                suffix += 1
+            except OSError:
+                try:
+                    backup.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix=f".{path.name}.", suffix=".tmp",
+            dir=path.parent, delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(updated.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        if before_replace is not None:
+            before_replace()
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return backup
+
+
 class PROCESSENTRY32W(ctypes.Structure):
     _fields_ = [
         ("dwSize", wintypes.DWORD),
@@ -148,8 +216,27 @@ class ProcessFinder:
             ctypes.POINTER(wintypes.DWORD),
         ]
         self.kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        self.kernel32.GetLastError.restype = wintypes.DWORD
 
-    def find(self) -> tuple[int, str, Path] | None:
+    def is_running(self) -> bool:
+        """Fail closed when the process list cannot be checked safely."""
+        snapshot = self.kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snapshot in (0, ctypes.c_void_p(-1).value):
+            return True
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(entry)
+            if not self.kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+                return self.kernel32.GetLastError() != 18  # ERROR_NO_MORE_FILES
+            while True:
+                if entry.szExeFile.casefold() in PROCESS_NAMES:
+                    return True
+                if not self.kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                    return self.kernel32.GetLastError() != 18
+        finally:
+            self.kernel32.CloseHandle(snapshot)
+
+    def find(self) -> tuple[int, str, Path | None] | None:
         snapshot = self.kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
         if snapshot in (0, ctypes.c_void_p(-1).value):
             return None
@@ -162,8 +249,9 @@ class ProcessFinder:
                 if entry.szExeFile.casefold() in PROCESS_NAMES:
                     pid = int(entry.th32ProcessID)
                     path = self.path(pid)
-                    if path:
-                        return pid, entry.szExeFile, path
+                    # The process name is enough to protect saves from writes
+                    # while the game is running, even if Windows denies path access.
+                    return pid, entry.szExeFile, path
                 if not self.kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
                     return None
         finally:
@@ -219,6 +307,10 @@ class Trainer(tk.Tk):
         self.process_text = tk.StringVar(value="游戏未运行")
         self.path_text = tk.StringVar(value=self.game_dir_text())
         self.diamond_value = tk.StringVar(value="")
+        self.save_account = tk.StringVar(value="")
+        self.save_account_invalidated = False
+        self.diamond_account = ""
+        self.save_account_combo = None
         self.max_health_value = tk.StringVar(value="3")
         self.coins_value = tk.StringVar(value="999999")
         self.coins_multiplier_value = tk.StringVar(value="2")
@@ -470,12 +562,15 @@ class Trainer(tk.Tk):
             "armor_chainmail": ("锁子甲",),
             "armor_leather": ("皮甲",),
             "armor_glass": ("玻璃护甲",),
+            "armor_heavyglass": ("重型玻璃护甲",),
+            "armor_heavyplate": ("重型板甲",),
             "armor_platemail": ("板甲", "板金甲"),
             "armor_obsidian": ("黑曜石护甲", "黑曜石甲"),
             "feet_boots_speed": ("速度之靴", "速度鞋"),
             "feet_boots_winged": ("飞翼之靴", "翅膀鞋"),
             "head_helm": ("头盔",),
             "head_crown_of_greed": ("贪婪王冠", "贪婪皇冠"),
+            "head_glass_jaw": ("玻璃下巴",),
             "head_monocle": ("单片眼镜", "显物眼镜"),
             "head_sunglasses": ("太阳镜", "墨镜"),
             "misc_map": ("地图",),
@@ -496,6 +591,7 @@ class Trainer(tk.Tk):
             "torch_obsidian": ("黑曜石火把", "黑曜石灯"),
             "torch_strength": ("力量火把",),
             "torch_walls": ("墙壁火把", "墙火把"),
+            "spell_transform": ("变身法术",),
         }
 
     @staticmethod
@@ -565,52 +661,201 @@ class Trainer(tk.Tk):
     def item_name_in_chinese(item_id: str, display: str) -> str:
         if display and display != item_id:
             return display
+        known = {
+            "addchest_black": "黑色宝箱",
+            "addchest_red": "红色宝箱",
+            "addchest_white": "紫色宝箱",
+            "armor_gi": "空手道服",
+            "armor_heavyglass": "重型玻璃护甲",
+            "armor_heavyplate": "重型板甲",
+            "armor_platemail_dorian": "多里安的板甲",
+            "armor_quartz": "石英护甲",
+            "bag_holding": "储物袋",
+            "bomb_3": "炸弹×3",
+            "bomb_grenade": "手雷",
+            "charm_bomb": "炸弹护符",
+            "charm_frost": "寒冰护符",
+            "charm_gluttony": "暴食护符",
+            "charm_grenade": "手雷护符",
+            "charm_luck": "幸运护符",
+            "charm_nazar": "护身符",
+            "charm_protection": "防护护符",
+            "charm_risk": "风险护符",
+            "charm_strength": "力量护符",
+            "coins_x15": "金币倍率 +0.5",
+            "coins_x2": "金币倍率 +1",
+            "double_heart_transplant": "双重心脏移植",
+            "familiar_dove": "鸽子使魔",
+            "familiar_ice_spirit": "冰灵使魔",
+            "familiar_rat": "老鼠使魔",
+            "familiar_shield": "护盾使魔",
+            "familiar_shopkeeper": "店主使魔",
+            "feet_ballet_shoes": "芭蕾舞鞋",
+            "feet_boots_explorers": "探险靴",
+            "feet_boots_leaping": "跳跃靴",
+            "feet_boots_lead": "铅靴",
+            "feet_boots_lunging": "突进靴",
+            "feet_boots_pain": "痛苦之靴",
+            "feet_boots_speed": "速度之靴",
+            "feet_boots_strength": "力量之靴",
+            "feet_boots_winged": "飞翼之靴",
+            "feet_glass_slippers": "玻璃舞鞋",
+            "food_carrot": "胡萝卜",
+            "food_cookies": "饼干",
+            "food_magic_1": "魔法苹果",
+            "food_magic_2": "魔法奶酪",
+            "food_magic_3": "魔法鸡腿",
+            "food_magic_4": "魔法火腿",
+            "food_magic_carrot": "魔法胡萝卜",
+            "food_magic_cookies": "魔法饼干",
+            "head_blast_helm": "爆炸头盔",
+            "head_circlet_telepathy": "心灵感应头环",
+            "head_crown_of_greed": "贪婪王冠",
+            "head_crown_of_thorns": "荆棘王冠",
+            "head_crown_of_teleportation": "传送王冠",
+            "head_glass_jaw": "玻璃下巴",
+            "head_helm": "头盔",
+            "head_miners_cap": "矿工帽",
+            "head_ninja_mask": "忍者面罩",
+            "head_sonar": "声呐",
+            "head_spiked_ears": "尖刺耳罩",
+            "lord_crown": "领主王冠",
+            "misc_golden_key2": "金钥匙",
+            "misc_golden_key3": "金钥匙",
+            "misc_heart_container": "心之容器",
+            "misc_heart_container2": "双重心之容器",
+            "misc_heart_container_cursed": "诅咒心之容器",
+            "misc_heart_container_cursed2": "双重诅咒心之容器",
+            "misc_heart_container_empty": "空心容器",
+            "misc_heart_container_empty2": "双重空心容器",
+            "misc_monkey_paw": "猴爪",
+            "ring_becoming": "蜕变戒指",
+            "ring_charisma": "魅力戒指",
+            "ring_courage": "勇气戒指",
+            "ring_frost": "寒冰戒指",
+            "ring_gold": "黄金戒指",
+            "ring_luck": "幸运戒指",
+            "ring_mana": "法力戒指",
+            "ring_might": "强力戒指",
+            "ring_pain": "痛苦戒指",
+            "ring_peace": "和平戒指",
+            "ring_phasing": "穿墙戒指",
+            "ring_piercing": "穿刺戒指",
+            "ring_protection": "防护戒指",
+            "ring_regeneration": "再生戒指",
+            "ring_shadows": "暗影戒指",
+            "ring_shielding": "护盾戒指",
+            "ring_war": "战争戒指",
+            "ring_wonder": "奇迹戒指",
+            "scroll_earthquake": "地震卷轴",
+            "scroll_enchant_weapon": "附魔卷轴",
+            "scroll_fear": "恐惧卷轴",
+            "scroll_fireball": "火球卷轴",
+            "scroll_freeze_enemies": "冰冻卷轴",
+            "scroll_gigantism": "巨人卷轴",
+            "scroll_need": "所需卷轴",
+            "scroll_pulse": "脉冲卷轴",
+            "scroll_riches": "财富卷轴",
+            "scroll_shield": "护盾卷轴",
+            "scroll_transmute": "转化卷轴",
+            "shovel_battle": "战斗铲",
+            "shovel_blood": "血铲",
+            "shovel_courage": "勇气铲",
+            "shovel_crystal": "水晶铲",
+            "shovel_glass": "玻璃铲",
+            "shovel_obsidian": "黑曜石铲",
+            "shovel_shard": "玻璃碎片",
+            "shovel_strength": "力量铲",
+            "shovel_titanium": "钛铲",
+            "spell_bomb": "炸弹法术",
+            "spell_charm": "魅惑法术",
+            "spell_earth": "大地法术",
+            "spell_fireball": "火球法术",
+            "spell_freeze_enemies": "冰冻法术",
+            "spell_heal": "治疗法术",
+            "spell_pulse": "脉冲法术",
+            "spell_shield": "护盾法术",
+            "spell_transform": "变身法术",
+            "spell_transmute": "转化法术",
+            "tome_earth": "大地法典",
+            "tome_fireball": "火球法典",
+            "tome_freeze": "冰冻法典",
+            "tome_pulse": "脉冲法典",
+            "tome_shield": "护盾法典",
+            "tome_transmute": "转化法典",
+            "torch_foresight": "预见火把",
+            "torch_walls": "墙壁火把",
+            "war_drum": "战鼓",
+            "weapon_blunderbuss": "短铳",
+            "weapon_cat": "九尾鞭",
+            "weapon_dagger_electric": "电击匕首",
+            "weapon_dagger_frost": "寒冰匕首",
+            "weapon_dagger_jeweled": "宝石匕首",
+            "weapon_dagger_shard": "玻璃碎片",
+            "weapon_eli": "伊莱的武器",
+            "weapon_flower": "花朵",
+        }
+        if item_id in known:
+            return known[item_id]
+        if item_id.startswith("resource_coin"):
+            return "金币堆"
+        if item_id.startswith("resource_diamond"):
+            return "钻石"
+        if item_id.startswith("resource_hoard"):
+            return "金币宝藏"
+        if item_id.startswith("perm_heart"):
+            return "永久心之容器"
         words = {
             "addchest": "额外宝箱", "all": "全部", "apple": "苹果",
             "armor": "护甲", "axe": "斧", "backpack": "背包", "bag": "袋",
             "ballet": "芭蕾", "battle": "战斗", "becoming": "变身",
             "black": "黑色", "blood": "血", "bomb": "炸弹",
-            "boots": "靴", "bow": "弓", "broadsword": "阔剑",
-            "carrot": "胡萝卜", "chainmail": "锁子甲", "charm": "护符",
+            "blunderbuss": "短铳", "boots": "靴", "bow": "弓",
+            "broadsword": "阔剑", "carrot": "胡萝卜", "cat": "九尾鞭",
+            "chainmail": "锁子甲", "charm": "护符", "charisma": "魅力",
             "cheese": "奶酪", "coin": "金币", "compass": "指南针",
             "container": "容器", "cookies": "饼干", "coupon": "优惠券",
             "courage": "勇气", "crystal": "水晶", "crown": "王冠",
             "crossbow": "弩", "cursed": "诅咒", "cutlass": "弯刀",
             "dagger": "匕首", "diamond": "钻石", "dorian": "多里安",
             "dove": "鸽子", "drum": "鼓", "drumstick": "鸡腿",
-            "double": "双倍", "earth": "大地", "electric": "雷电",
-            "empty": "空", "familiar": "使魔", "fangs": "尖牙",
-            "fear": "恐惧", "feet": "", "fireball": "火球", "flail": "连枷",
-            "flower": "花", "food": "食物", "free": "免费",
-            "freeze": "冰冻", "frost": "寒冰", "gi": "空手道服",
+            "double": "双倍", "earth": "大地", "earthquake": "地震",
+            "electric": "雷电", "eli": "伊莱", "empty": "空",
+            "enchant": "附魔", "explorers": "探险", "familiar": "使魔",
+            "fangs": "尖牙", "fear": "恐惧", "feet": "",
+            "fireball": "火球", "flail": "连枷", "flower": "花",
+            "food": "食物", "free": "免费", "freeze": "冰冻",
+            "frost": "寒冰", "gi": "空手道服", "gigantism": "巨人",
             "glass": "玻璃", "gluttony": "暴食", "gold": "黄金",
             "golden": "黄金", "greaves": "护腿", "grenade": "手雷",
             "ham": "火腿", "harp": "竖琴", "head": "", "heal": "治疗",
             "heart": "心脏", "heavy": "重型", "hoard": "宝藏",
             "holster": "枪套", "holy": "圣水", "ice": "冰",
-            "infernal": "地狱", "key": "钥匙", "leather": "皮革",
-            "leaping": "跳跃", "longsword": "长剑", "luck": "幸运",
+            "infernal": "地狱", "jeweled": "宝石", "key": "钥匙",
+            "lead": "铅", "leather": "皮革", "leaping": "跳跃",
+            "longsword": "长剑", "luck": "幸运", "lunging": "突进",
             "lute": "鲁特琴", "magic": "魔法", "magnet": "磁铁",
             "map": "地图", "mana": "法力", "mary": "玛丽",
             "melody": "梅洛迪", "miner": "矿工", "might": "强力",
             "misc": "", "monkey": "猴子", "monocle": "单片眼镜",
-            "nazar": "护符", "obsidian": "黑曜石", "pain": "痛苦",
-            "peace": "和平", "perm": "永久", "phasing": "穿透",
-            "pickaxe": "镐", "piercing": "穿刺", "plate": "板甲",
-            "platemail": "板甲", "protection": "防护", "potion": "药水",
-            "pulse": "脉冲", "quartz": "石英", "rapier": "刺剑",
-            "rat": "老鼠", "red": "红色", "regeneration": "再生",
-            "resource": "资源", "ring": "戒指", "risk": "风险",
-            "rifle": "步枪", "scroll": "卷轴", "shard": "碎片",
-            "shadows": "暗影", "shield": "盾牌", "shovel": "铲",
-            "spear": "长矛", "spell": "法术", "staff": "法杖",
-            "sonar": "声呐", "strength": "力量", "sun": "太阳",
-            "sunglasses": "太阳镜", "telepathy": "心灵感应",
+            "nazar": "护符", "need": "所需", "obsidian": "黑曜石",
+            "pain": "痛苦", "peace": "和平", "perm": "永久",
+            "phasing": "穿透", "pickaxe": "镐", "piercing": "穿刺",
+            "plate": "板甲", "platemail": "板甲", "protection": "防护",
+            "potion": "药水", "pulse": "脉冲", "quartz": "石英",
+            "rapier": "刺剑", "rat": "老鼠", "red": "红色",
+            "regeneration": "再生", "resource": "资源", "riches": "财富",
+            "ring": "戒指", "risk": "风险", "rifle": "步枪",
+            "scroll": "卷轴", "shard": "碎片", "shadows": "暗影",
+            "shield": "盾牌", "shielding": "护盾", "shopkeeper": "店主",
+            "shovel": "铲", "spear": "长矛", "spell": "法术",
+            "staff": "法杖", "sonar": "声呐", "strength": "力量",
+            "sun": "太阳", "sunglasses": "太阳镜", "telepathy": "心灵感应",
             "teleportation": "传送", "thorns": "荆棘", "titanium": "钛",
-            "torch": "火把", "transmute": "转化", "transplant": "移植",
-            "throwing": "投掷", "weapon": "", "war": "战争",
-            "warhammer": "战锤", "whip": "鞭", "white": "紫色",
-            "winged": "飞翼", "wonder": "奇迹", "x": "倍",
+            "tome": "法典", "torch": "火把", "transmute": "转化",
+            "transplant": "移植", "throwing": "投掷", "weapon": "",
+            "war": "战争", "warhammer": "战锤", "whip": "鞭",
+            "white": "紫色", "winged": "飞翼", "wonder": "奇迹", "x": "倍",
             "1": "一", "2": "二", "3": "三", "4": "四",
             "5": "五", "6": "六", "7": "七", "8": "八",
             "9": "九", "10": "十", "15": "十五", "50": "五十",
@@ -1067,14 +1312,24 @@ class Trainer(tk.Tk):
     def catalog_matches(self, query: str, catalog: list[tuple[str, str]]) -> list[tuple[str, str]]:
         folded = query.casefold()
         aliases = self.catalog_aliases(catalog)
-        return [
-            (internal, display)
-            for internal, display in catalog
-            if not folded
-            or folded in internal.casefold()
-            or folded in display.casefold()
-            or any(folded in alias.casefold() for alias in aliases.get(internal, ()))
-        ]
+        generated_names = catalog is self.item_catalog
+        matches = []
+        for internal, display in catalog:
+            if not folded:
+                matches.append((internal, display))
+                continue
+            generated = (
+                self.item_name_in_chinese(internal, display)
+                if generated_names else ""
+            )
+            if (
+                folded in internal.casefold()
+                or folded in display.casefold()
+                or folded in generated.casefold()
+                or any(folded in alias.casefold() for alias in aliases.get(internal, ()))
+            ):
+                matches.append((internal, display))
+        return matches
 
     @staticmethod
     def item_category(item_id: str, metadata: dict) -> str:
@@ -1440,7 +1695,7 @@ class Trainer(tk.Tk):
 
     def ensure_mod_enabled(self) -> None:
         # The game writes its in-memory options on exit. Repair only while stopped.
-        if self.finder.find():
+        if self.game_is_running():
             return
         save_root = APPDATA / "NecroDancer"
         option_files = [save_root / "SynchronyOptions.lua"]
@@ -1450,17 +1705,28 @@ class Trainer(tk.Tk):
             if not options.is_file():
                 continue
             try:
-                text = options.read_text(encoding="utf-8")
-            except OSError:
+                original = options.read_bytes()
+                text = original.decode("utf-8")
+            except FileNotFoundError:
+                continue
+            except UnicodeError:
                 continue
             existing = re.search(
-                r'\{name="NecroDancerTrainer",package=false,version="([^"]+)"\}',
+                r'\{(?=[^{}]*\bname\s*=\s*"NecroDancerTrainer")[^{}]*\}',
                 text,
             )
             if existing:
-                if existing.group(1) == MOD_VERSION:
+                entry = existing.group(0)
+                version = re.search(r'\bversion\s*=\s*"([^"]+)"', entry)
+                if version and version.group(1) == MOD_VERSION:
                     continue
-                updated = text[:existing.start(1)] + MOD_VERSION + text[existing.end(1):]
+                if version:
+                    updated_entry = (
+                        entry[:version.start(1)] + MOD_VERSION + entry[version.end(1):]
+                    )
+                else:
+                    updated_entry = entry[:-1] + f',version="{MOD_VERSION}"' + entry[-1]
+                updated = text[:existing.start()] + updated_entry + text[existing.end():]
             elif marker in text:
                 updated = text.replace(
                     marker,
@@ -1469,11 +1735,20 @@ class Trainer(tk.Tk):
                 )
             else:
                 continue
-            BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-            backup = BACKUP_DIR / f"{options.name}.before_trainer_{time.strftime('%Y%m%d-%H%M%S')}.bak"
-            if not backup.exists():
-                backup.write_text(text, encoding="utf-8", newline="")
-            options.write_text(updated, encoding="utf-8", newline="")
+            backup_and_replace_save(
+                options, original, updated, "before_trainer",
+                before_replace=lambda: self.require_game_stopped(
+                    "游戏已启动，已取消模组配置写入"
+                ),
+            )
+
+    def game_is_running(self) -> bool:
+        checker = getattr(self.finder, "is_running", None)
+        return checker() if checker else bool(self.finder.find())
+
+    def require_game_stopped(self, message: str) -> None:
+        if self.game_is_running():
+            raise GameRunningError(message)
 
     def load_config(self) -> None:
         values = {}
@@ -1746,6 +2021,17 @@ class Trainer(tk.Tk):
                 panel, text, muted, accent, integer=integer, step=step,
             )
             row += 1
+        account_row = tk.Frame(value_panel, bg=panel, height=self.ui_px(32))
+        account_row.pack(fill="x", pady=self.ui_px(1))
+        account_row.pack_propagate(False)
+        tk.Label(account_row, text="存档账号", fg=text, bg=panel,
+                 anchor="w", font=self.ui_fonts["label"]).pack(side="left")
+        self.save_account_combo = ttk.Combobox(
+            account_row, textvariable=self.save_account, state="readonly", width=25,
+        )
+        self.save_account_combo.pack(side="right", fill="x", expand=True, padx=(8, 0))
+        self.save_account_combo.bind("<<ComboboxSelected>>", self.refresh_diamonds)
+        self.refresh_save_accounts()
 
         tools = tk.Frame(main, bg=bg)
         tools.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(7, 0))
@@ -1980,10 +2266,14 @@ class Trainer(tk.Tk):
             return False
         if found:
             pid, name, executable = found
-            self.game_dir = executable.parent.parent if executable.parent.name.casefold() == "necrodancer64" else executable.parent
-            self.path_text.set(self.game_dir_text())
             self.process_text.set(f"已连接  ·  {name}  PID {pid}")
-            self.status.set("已连接游戏；模组配置已同步")
+            if executable:
+                game_dir = executable.parent.parent if executable.parent.name.casefold() == "necrodancer64" else executable.parent
+                self.set_game_dir(game_dir)
+                self.path_text.set(self.game_dir_text())
+                self.status.set("已连接游戏；模组配置已同步")
+            else:
+                self.status.set("已检测到游戏进程，但无法读取程序路径；存档保护仍已启用")
             return True
         self.process_text.set("游戏未运行")
         self.status.set("未检测到游戏")
@@ -1999,12 +2289,25 @@ class Trainer(tk.Tk):
             return
         if found:
             pid, name, executable = found
-            self.game_dir = executable.parent.parent if executable.parent.name.casefold() == "necrodancer64" else executable.parent
-            self.path_text.set(self.game_dir_text())
             self.process_text.set(f"已连接  ·  {name}  PID {pid}")
+            if executable:
+                game_dir = executable.parent.parent if executable.parent.name.casefold() == "necrodancer64" else executable.parent
+                self.set_game_dir(game_dir)
+                self.path_text.set(self.game_dir_text())
+            else:
+                self.status.set("已检测到游戏进程，但无法读取程序路径；存档保护仍已启用")
         else:
             self.process_text.set("游戏未运行")
         self.after(800, self.poll)
+
+    def set_game_dir(self, game_dir: Path) -> None:
+        if game_dir == self.game_dir:
+            return
+        self.game_dir = game_dir
+        self.item_metadata.clear()
+        self.item_icon_cache.clear()
+        self.item_catalog = self.load_item_catalog()
+        self.character_catalog = self.load_character_catalog()
 
     def find_steam(self) -> Path | None:
         candidates = [
@@ -2216,8 +2519,10 @@ class Trainer(tk.Tk):
 
     def apply_character(self):
         requested = self.character_search.get().strip() or self.character_value.get().strip()
+        # Keep character matching to IDs, display names, and explicit aliases.
         value = self.resolve_catalog_value(
-            requested, self.character_catalog, self.character_aliases
+            requested, self.character_catalog, self.character_aliases,
+            allow_generated=False,
         )
         if value not in {internal for internal, _display in self.character_catalog}:
             messagebox.showwarning("角色 ID 无效", "请输入角色中文名或内部 ID，例如 卡登斯 / Cadence")
@@ -2237,42 +2542,90 @@ class Trainer(tk.Tk):
         value: str,
         catalog: list[tuple[str, str]],
         aliases: dict[str, tuple[str, ...]] | None = None,
+        allow_generated: bool = True,
     ) -> str:
         folded = value.casefold()
+        matches = set()
         for internal, display in catalog:
-            names = aliases.get(internal, ()) if aliases else ()
-            if (
-                folded == internal.casefold()
-                or folded == display.casefold()
-                or any(folded == alias.casefold() for alias in names)
-            ):
-                return internal
+            names = [internal, display]
+            if aliases:
+                names.extend(aliases.get(internal, ()))
+            if allow_generated:
+                names.append(Trainer.item_name_in_chinese(internal, display))
+            if any(folded == name.casefold() for name in names):
+                matches.add(internal)
+        # A name shared by several catalog entries must stay unresolved so the
+        # caller never silently requests the first item that happens to match.
+        if len(matches) == 1:
+            return matches.pop()
         return value
 
-    def latest_save(self) -> Path | None:
-        files = sorted(SAVE_DIR.glob("SynchronyUser_*.lua"),
-                       key=lambda path: path.stat().st_mtime, reverse=True)
-        return files[0] if files else None
+    def save_files(self) -> list[Path]:
+        return sorted(SAVE_DIR.glob("SynchronyUser_*.lua"), key=lambda path: path.name.casefold())
 
-    def refresh_diamonds(self):
+    def refresh_save_accounts(self, _event=None):
+        files = self.save_files()
+        names = [path.name for path in files]
+        current = self.save_account.get()
+        if current not in names:
+            had_selection = bool(current)
+            current = (
+                names[0]
+                if not current and not self.save_account_invalidated and len(names) == 1
+                else ""
+            )
+            self.save_account.set(current)
+            self.diamond_value.set("")
+            self.diamond_account = ""
+            if had_selection:
+                self.save_account_invalidated = True
+            if had_selection:
+                self.status.set("存档账号已变更，请重新选择账号")
+        else:
+            self.save_account_invalidated = False
+        if self.save_account_combo is not None:
+            self.save_account_combo.configure(values=names)
+        return files
+
+    def latest_save(self) -> Path | None:
+        files = self.refresh_save_accounts()
+        selected = self.save_account.get()
+        if selected:
+            return next((path for path in files if path.name == selected), None)
+        if len(files) == 1 and not self.save_account_invalidated:
+            return files[0]
+        return None
+
+    def refresh_diamonds(self, _event=None):
+        self.diamond_value.set("")
+        self.diamond_account = ""
+        self.refresh_save_accounts()
         path = self.latest_save()
         if not path:
             return
         try:
             text = path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeError) as exc:
+            self.status.set(f"无法读取存档钻石：{exc}")
             return
         match = re.search(r'\["progression\.diamondCounter"\]\s*=\s*(\d+)', text)
         if match:
             self.diamond_value.set(match.group(1))
+            self.diamond_account = path.name
+        else:
+            self.status.set("存档中没有找到钻石字段")
 
     def write_diamonds(self):
-        if self.finder.find():
+        if self.game_is_running():
             self.status.set("请先退出游戏，再修改永久钻石，避免存档被游戏覆盖")
             return
         path = self.latest_save()
         if not path:
-            self.status.set("未找到存档")
+            self.status.set("未找到存档，请先确认存档目录或选择存档账号")
+            return
+        if self.diamond_account != path.name:
+            self.diamond_value.set("")
+            self.status.set("钻石数未从当前账号加载，请重新选择存档账号")
             return
         try:
             value = int(self.diamond_value.get())
@@ -2281,10 +2634,12 @@ class Trainer(tk.Tk):
         except ValueError:
             messagebox.showwarning("数量无效", "请输入 0 到 2147483647 之间的整数")
             return
-        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        backup = BACKUP_DIR / f"{path.name}.{time.strftime('%Y%m%d-%H%M%S')}.bak"
-        backup.write_bytes(path.read_bytes())
-        text = path.read_text(encoding="utf-8")
+        try:
+            original = path.read_bytes()
+            text = original.decode("utf-8")
+        except (OSError, UnicodeError) as exc:
+            self.status.set(f"无法读取存档：{exc}")
+            return
         updated, count = re.subn(
             r'(\["progression\.diamondCounter"\]\s*=\s*)\d+',
             rf"\g<1>{value}",
@@ -2294,20 +2649,33 @@ class Trainer(tk.Tk):
         if count != 1:
             self.status.set("存档中没有找到钻石字段")
             return
-        path.write_text(updated, encoding="utf-8", newline="")
-        self.status.set(f"已写入 {value} 颗钻石；备份已保存")
+        try:
+            backup = backup_and_replace_save(
+                path, original, updated, "before_diamonds",
+                before_replace=lambda: self.require_game_stopped(
+                    "游戏已启动，已取消钻石写入"
+                ),
+            )
+        except GameRunningError as exc:
+            self.status.set(str(exc))
+            return
+        except OSError as exc:
+            self.status.set(f"写入钻石失败，原存档未替换：{exc}")
+            return
+        self.status.set(f"已写入 {value} 颗钻石；备份：{backup.name}")
 
     def unlock_all_regions(self):
-        if self.finder.find():
+        if self.game_is_running():
             self.status.set("已开启游戏内解锁；游戏运行时不直接改写存档")
             return
         path = self.latest_save()
         if not path:
-            self.status.set("已开启解锁全部区域；未找到存档，进入游戏后由 Mod 尝试执行")
+            self.status.set("未选择存档账号或未找到存档；角色解锁仍由游戏内 Mod 处理")
             return
         try:
-            text = path.read_text(encoding="utf-8")
-        except OSError as exc:
+            original = path.read_bytes()
+            text = original.decode("utf-8")
+        except (OSError, UnicodeError) as exc:
             self.status.set(f"无法读取存档：{exc}")
             return
 
@@ -2317,40 +2685,36 @@ class Trainer(tk.Tk):
             pattern = rf"(NumZone{zone}Completions\s*=\s*)\d+"
             updated, count = re.subn(pattern, rf"\g<1>9999", updated, count=1)
             changed += count
-        unlock_match = re.search(
-            r'(\["progression\.unlocks\.user"\]\s*=\s*)(.*?)(,\s*\r?\n)',
-            updated,
-            flags=re.DOTALL,
-        )
-        if unlock_match:
-            unlock_text = unlock_match.group(2)
-            names = [
-                "Aria", "Melody", "Dorian", "Eli", "Monk", "Coda", "Bolt",
-                "Bard", "Nocturna", "Diamond", "Mary", "Tempo", "Dove",
-                "Reaper", "Chaunter", "Klarinetta", "Suzu", "Kento",
-            ]
-            for name in names:
-                if re.search(rf"\b{re.escape(name)}\s*=\s*true", unlock_text):
-                    continue
-                unlock_text = unlock_text.replace("{", "{" + name + "=true,", 1)
-            updated = updated[:unlock_match.start(2)] + unlock_text + updated[unlock_match.end(2):]
-            changed += 1
         if changed == 0:
-            self.status.set("已开启解锁全部区域和角色；当前存档格式未找到可写字段")
+            self.status.set("当前存档格式未找到区域完成字段；角色解锁由游戏内 Mod 处理")
             return
 
-        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        backup = BACKUP_DIR / f"{path.name}.before_unlock_{time.strftime('%Y%m%d-%H%M%S')}.bak"
-        backup.write_bytes(path.read_bytes())
         try:
-            path.write_text(updated, encoding="utf-8", newline="")
-        except OSError as exc:
-            self.status.set(f"写入区域解锁失败：{exc}")
+            backup = backup_and_replace_save(
+                path, original, updated, "before_unlock",
+                before_replace=lambda: self.require_game_stopped(
+                    "游戏已启动，已取消区域解锁写入"
+                ),
+            )
+        except GameRunningError as exc:
+            self.status.set(str(exc))
             return
-        self.status.set("已写入区域 1 到 5 的完成状态；备份已保存，请重启游戏读取")
+        except OSError as exc:
+            self.status.set(f"写入区域解锁失败，原存档未替换：{exc}")
+            return
+        self.status.set(
+            f"已写入区域 1 到 5 的完成状态；备份：{backup.name}。"
+            "请重启游戏读取。角色解锁由游戏内 Mod 处理"
+        )
 
 
 if __name__ == "__main__":
     if os.name != "nt":
         raise SystemExit("仅支持 Windows")
-    Trainer().mainloop()
+    try:
+        Trainer().mainloop()
+    except Exception as exc:
+        messagebox.showerror(
+            "NecroDancer Trainer 启动失败",
+            f"初始化或运行时发生错误：\n{exc}\n\n请检查游戏目录、模组目录和配置文件权限。",
+        )

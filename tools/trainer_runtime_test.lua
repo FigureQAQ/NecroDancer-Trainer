@@ -10,6 +10,30 @@ local validEvents = {
 	objectComputeDigStrength = true,
 	priceTagCheck = true,
 }
+local validOrders = {
+	levelComplete = {
+		collectItems = true,
+		dad = true,
+		pendingDelays = true,
+		speedrunTimer = true,
+		unlocks = true,
+		ensemble = true,
+		multiChar = true,
+		stats = true,
+		deathless = true,
+		resetPlayers = true,
+		cutscene = true,
+		winScreen = true,
+		nextLevel = true,
+		notifyHost = true,
+	},
+	objectComputeDigStrength = {
+		charge = true,
+		confusion = true,
+		fear = true,
+	},
+}
+local registeredOptions = {}
 local config = table.concat({
 	"keepCoinsOnTransition=1",
 	"freeShop=1",
@@ -30,6 +54,13 @@ local config = table.concat({
 local players = {}
 local function register(eventName, id, options, callback)
 	assert(validEvents[eventName], "invalid game event registered: " .. eventName)
+	local eventOrders = validOrders[eventName]
+	if eventOrders then
+		assert(type(options.order) == "string", "missing ordering key for " .. eventName)
+		assert(eventOrders[options.order], "invalid ordering key for " .. eventName .. ": " .. tostring(options.order))
+	end
+	registeredOptions[eventName] = registeredOptions[eventName] or {}
+	registeredOptions[eventName][id] = options
 	callbacks[eventName] = callbacks[eventName] or {}
 	callbacks[eventName][id] = callback
 end
@@ -98,6 +129,15 @@ package.preload["necro.game.item.Inventory"] = function()
 		end,
 	}
 end
+local rhythmSettings = {}
+package.preload["necro.game.character.Rhythm"] = function()
+	return {
+		getRhythmSettings = function(playerID)
+			rhythmSettings[playerID] = rhythmSettings[playerID] or {ignoreRhythm = false}
+			return rhythmSettings[playerID]
+		end,
+	}
+end
 package.preload["necro.game.character.CharacterSwitch"] = function()
 	return {
 		perform = function(entity, characterType)
@@ -123,6 +163,13 @@ package.preload["core.Logger"] = function() error("not installed") end
 package.preload["necro.debug.DebugCommands"] = function() error("not installed") end
 package.preload["necro.game.system.Progression"] = function() error("not installed") end
 dofile("mod/NecroDancerTrainer.lua")
+
+local digOptions = registeredOptions.objectComputeDigStrength.trainerDigAll
+assert(digOptions.order == "charge", "dig-all uses an invalid ordering key")
+assert(digOptions.sequence == 1000, "dig-all must run after the base dig-strength handlers")
+local transitionOptions = registeredOptions.levelComplete.trainerCaptureTransitionCoins
+assert(transitionOptions.order == "collectItems", "coin snapshot must run before level-completion handlers")
+assert(transitionOptions.sequence == -1000, "coin snapshot must precede the collectItems phase")
 
 local function tick(count)
 	for _ = 1, count do callbacks.frame.trainerConfig() end
@@ -155,6 +202,8 @@ assert(increased == 7, "health API did not add the expected max health")
 assert(first.visionRadial.radius == 12, "vision radius was not applied")
 assert(second.lightSourceRadial.innerRadius == 12 * 256, "player light radius was not applied")
 assert(visionUpdates > 0, "vision update was not queued")
+assert(rhythmSettings[1].ignoreRhythm and rhythmSettings[2].ignoreRhythm,
+	"force beat did not enable ignoreRhythm for all players")
 assert(grantedItem == nil, "persisted item request replayed")
 assert(callbacks.tileVisionRadius == nil and callbacks.objectVisionRadius == nil,
 	"unsupported vision events must not be registered")
@@ -188,6 +237,13 @@ assert(outgoing.damage == 999999, "one-hit damage was not applied")
 local ability = {flags = 6}
 callbacks.objectCheckAbility.trainerForceBeat(ability)
 assert(ability.flags == 4, "beat-delay flag was not removed")
+
+config = config .. "\nforceBeat=0"
+tick(15)
+assert(not rhythmSettings[1].ignoreRhythm and not rhythmSettings[2].ignoreRhythm,
+	"disabling force beat did not restore regular rhythm")
+config = config .. "\nforceBeat=1"
+tick(15)
 
 local dig = {strength = 1}
 callbacks.objectComputeDigStrength.trainerDigAll(dig)

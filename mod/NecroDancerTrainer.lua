@@ -8,6 +8,7 @@ local okInventory, Inventory = pcall(require, "necro.game.item.Inventory")
 local okCurrency, Currency = pcall(require, "necro.game.item.Currency")
 local okCharacterSwitch, CharacterSwitch = pcall(require, "necro.game.character.CharacterSwitch")
 local okAbility, Ability = pcall(require, "necro.game.system.Ability")
+local okRhythm, Rhythm = pcall(require, "necro.game.character.Rhythm")
 local okHealth, Health = pcall(require, "necro.game.character.Health")
 local okDig, Dig = pcall(require, "necro.game.tile.Dig")
 local okVision, Vision = pcall(require, "necro.game.vision.Vision")
@@ -53,6 +54,7 @@ local configReported = false
 local healthReported = false
 local beatReported = false
 local beatUnavailableReported = false
+local rhythmReported = false
 local multiplierReported = false
 local digReported = false
 local unlockAllApplied = false
@@ -597,6 +599,31 @@ local function applyCharacter()
 	end
 end
 
+local function applyRhythmOverride()
+	if not okRhythm or type(Rhythm.getRhythmSettings) ~= "function" then
+		return
+	end
+	for entity in players() do
+		local controllable = component(entity, "controllable")
+		local playerID = controllable and controllable.playerID
+		if playerID ~= nil then
+			local ok, settings = pcall(Rhythm.getRhythmSettings, playerID)
+			if ok and type(settings) == "table" then
+				if settings.ignoreRhythm ~= config.forceBeat then
+					settings.ignoreRhythm = config.forceBeat
+					if type(settings.updateRhythm) == "function" then
+						pcall(settings.updateRhythm)
+					end
+				end
+				if config.forceBeat and not rhythmReported then
+					report("[NecroDancerTrainer] player rhythm judgment bypass applied")
+					rhythmReported = true
+				end
+			end
+		end
+	end
+end
+
 local function applyDigAll(ev)
 	if not config.digAll then
 		return
@@ -630,9 +657,11 @@ event.frame.add("trainerConfig", "delayedCasts", function()
 		end
 	end
 	if tickCounter % 15 ~= 0 then
+		applyRhythmOverride()
 		return
 	end
 	readConfig()
+	applyRhythmOverride()
 	applyMaxHealth()
 	applyVisionRadius()
 	applyCoinsValue()
@@ -660,7 +689,7 @@ addEvent("objectCurrency", "trainerCoinMultiplier", {
 	end
 end)
 addEvent("levelComplete", "trainerCaptureTransitionCoins", {
-	order = "levelComplete",
+	order = "collectItems",
 	sequence = -1000,
 }, captureTransitionCoins)
 addEvent("gameStateLevel", "trainerRestoreTransitionCoins", {
@@ -727,7 +756,7 @@ addEvent("objectCheckAbility", "trainerForceBeat", {
 }, forceBeatAbility)
 
 addEvent("objectComputeDigStrength", "trainerDigAll", {
-	order = "computeStrength",
+	order = "charge",
 	sequence = 1000,
 }, applyDigAll)
 

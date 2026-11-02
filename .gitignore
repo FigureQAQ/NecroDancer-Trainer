@@ -3,6 +3,7 @@ build/
 *.spec
 *.pyc
 ModifierBackups/
-dist/*_[0-9]*.exe
+dist/*.exe
 source-ui.*.log
 ui-check*.png
+/archive/

@@ -43,7 +43,8 @@ def smoke(dpi):
                 app.show_item_tooltip("torch_obsidian", 100, 100)
                 pump(app)
                 assert app.item_tooltip and app.item_tooltip.winfo_exists()
-                app.item_window.event_generate("<Escape>")
+                app.item_window_search_entry.focus_force()
+                app.item_window_search_entry.event_generate("<Escape>")
                 pump(app)
                 assert app.item_window is None, "Escape did not close the item window"
                 assert app.winfo_exists(), "Closing item window also closed the trainer"

@@ -1,7 +1,7 @@
 {
   "namespace": "NecroDancerTrainer",
   "displayName": "NecroDancer Trainer",
-  "version": "1.4.18",
+  "version": "1.4.19",
   "synchronyVersion": "4.2.1",
   "description": "Local single-player trainer integration.",
   "author": "FigureQAQ",
